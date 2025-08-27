@@ -63,19 +63,59 @@ class LogManager:
         Registra um erro no processamento
         """
         timestamp = datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')
-        
+
         log_entry = f"ERRO REGISTRADO\n"
         log_entry += f"Data/Hora: {timestamp}\n"
         log_entry += f"ID do Aluno: {id_aluno}\n"
         log_entry += f"Erro: {erro}\n"
         log_entry += "-" * 30 + "\n\n"
-        
+
         try:
             with open(self.log_file, 'a', encoding='utf-8') as f:
                 f.write(log_entry)
             print(f"📝 Erro registrado para aluno {id_aluno}")
         except Exception as e:
             print(f"❌ Erro ao registrar erro no log: {e}")
+
+    def registrar_aula_pulada(self, id_aluno: str, numero_aula: str, motivo: str = "FIC encontrado junto com Matric"):
+        """
+        Registra uma aula que foi pulada no processamento
+        """
+        timestamp = datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')
+
+        log_entry = f"AULA PULADA\n"
+        log_entry += f"Data/Hora: {timestamp}\n"
+        log_entry += f"ID do Aluno: {id_aluno}\n"
+        log_entry += f"Número da Aula: {numero_aula}\n"
+        log_entry += f"Motivo: {motivo}\n"
+        log_entry += "-" * 30 + "\n\n"
+
+        try:
+            with open(self.log_file, 'a', encoding='utf-8') as f:
+                f.write(log_entry)
+            print(f"📝 Aula pulada registrada - Aluno: {id_aluno}, Aula: {numero_aula}")
+        except Exception as e:
+            print(f"❌ Erro ao registrar aula pulada no log: {e}")
+
+    def registrar_finalizacao(self, total_processados: int, total_encontrados: int):
+        """
+        Registra a finalização do processamento
+        """
+        timestamp = datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')
+
+        log_entry = f"=== PROCESSAMENTO FINALIZADO ===\n"
+        log_entry += f"Data/Hora de Finalização: {timestamp}\n"
+        log_entry += f"Total de Alunos Encontrados: {total_encontrados}\n"
+        log_entry += f"Total de Alunos Processados: {total_processados}\n"
+        log_entry += f"Status: CONCLUÍDO\n"
+        log_entry += "=" * 50 + "\n"
+
+        try:
+            with open(self.log_file, 'a', encoding='utf-8') as f:
+                f.write(log_entry)
+            print(f"📝 Finalização registrada no log")
+        except Exception as e:
+            print(f"❌ Erro ao registrar finalização no log: {e}")
 
 # Inicializar o sistema de logging
 log_manager = LogManager()
@@ -125,11 +165,40 @@ clicar_assim_aparecer(By.XPATH, """//*[@id="fldra_HCSR_ATTENDANCE_ROSTER"]""")
 clicar_assim_aparecer(By.XPATH, """//*[@id="crefli_HC_STDNT_ATTENDANCE_GBL"]/a""")
 
 # Loop nos IDs da planilha
+total_linhas_processadas = 0
+linhas_com_dados = 0
+
+# Primeiro, contar quantas linhas têm dados válidos
+for row in lista_atestados.iter_rows(min_row=2, max_row=lista_atestados.max_row, min_col=1, max_col=lista_atestados.max_column):
+    if row[1].value is not None and str(row[1].value).strip():  # Verifica se há ID do aluno
+        linhas_com_dados += 1
+
+print(f"📊 Total de alunos encontrados na planilha: {linhas_com_dados}")
+
+if linhas_com_dados == 0:
+    print("⚠️ Nenhum dado válido encontrado na planilha. Encerrando o processo.")
+    log_manager.registrar_erro("SISTEMA", "Nenhum dado válido encontrado na planilha")
+    driver.quit()
+    exit()
+
 for row in lista_atestados.iter_rows(min_row=2, max_row=lista_atestados.max_row, min_col=1, max_col=lista_atestados.max_column):
     current_id = row[1].value
     current_inicio = row[2].value
     current_fim = row[3].value
-    
+
+    # Verificar se a linha tem dados válidos
+    if current_id is None or str(current_id).strip() == "":
+        print(f"⚠️ Linha vazia encontrada. Pulando...")
+        continue
+
+    if current_inicio is None or current_fim is None:
+        print(f"⚠️ Datas inválidas para aluno {current_id}. Pulando...")
+        log_manager.registrar_erro(str(current_id), "Datas de início ou fim não informadas")
+        continue
+
+    total_linhas_processadas += 1
+    print(f"🔄 Processando aluno {total_linhas_processadas}/{linhas_com_dados}: {current_id}")
+
     # Lista para armazenar as aulas processadas para este aluno
     aulas_processadas = []
     status_processamento = "SUCESSO"
@@ -244,7 +313,16 @@ for row in lista_atestados.iter_rows(min_row=2, max_row=lista_atestados.max_row,
                 print(tabela_verificacao.text)
 
                 if "Matric" in tabela_verificacao.text:
-                    print("✅ O texto 'Matric' foi encontrado na tabela.")
+                    # Verificar se também contém "FIC" - se sim, pular esta aula
+                    if "FIC" in tabela_verificacao.text:
+                        print(f"⚠️ Encontrado 'Matric' e 'FIC' na tabela da aula {numero_aula}. Pulando esta aula.")
+                        log_manager.registrar_aula_pulada(current_id, numero_aula, "FIC encontrado junto com Matric")
+                        clicar_assim_aparecer(By.XPATH, '//*[@id="DERIVED_AA2_DERIVED_LINK10$0"]')
+                        aulas_processadas.append(f"Aula {numero_aula} - Pulada (FIC + Matric)")
+                        sleep(2)
+                        continue
+
+                    print("✅ O texto 'Matric' foi encontrado na tabela (sem FIC).")
                     clicar_assim_aparecer(By.XPATH, '//*[@id="ICTAB_1"]')
 
                     # Inserir as datas e informações conforme o TODO
@@ -276,7 +354,7 @@ for row in lista_atestados.iter_rows(min_row=2, max_row=lista_atestados.max_row,
                     # Adicionar aula processada com sucesso à lista
                     aulas_processadas.append(f"Aula {numero_aula} - Lançamento realizado")
                     sleep(2)
-                    
+
                 else:
                     print("❌ O texto 'Matric' NÃO foi encontrado na tabela.")
                     clicar_assim_aparecer(By.XPATH, '//*[@id="DERIVED_AA2_DERIVED_LINK10$0"]')
@@ -317,4 +395,19 @@ for row in lista_atestados.iter_rows(min_row=2, max_row=lista_atestados.max_row,
     clicar_assim_aparecer(By.XPATH, """//*[@id="fldra_HCSR_ATTENDANCE_ROSTER"]""")
     clicar_assim_aparecer(By.XPATH, """//*[@id="crefli_HC_STDNT_ATTENDANCE_GBL"]/a""")
 
-print("🎉 Processamento concluído! Verifique o arquivo de log na pasta 'log'.")
+# Encerramento do processo
+print("🎉 Processamento concluído!")
+print(f"📊 Total de alunos processados: {total_linhas_processados}/{linhas_com_dados}")
+print(f"📝 Verifique o arquivo de log na pasta 'log': {log_manager.log_file}")
+
+# Registrar finalização no log usando o método do LogManager
+log_manager.registrar_finalizacao(total_linhas_processadas, linhas_com_dados)
+
+# Fechar o navegador
+try:
+    driver.quit()
+    print("🔒 Navegador fechado com sucesso.")
+except Exception as e:
+    print(f"⚠️ Erro ao fechar o navegador: {e}")
+
+print("✅ Processo encerrado completamente.")

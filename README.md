@@ -6,7 +6,6 @@
 - `AutoAtestado.exe` (ou pasta `AutoAtestado` com o executável)
 - `atestados.xlsx` (planilha com os dados dos alunos)
 - `chromedriver.exe` (driver do Chrome para automação)
-- `Executar_AutoAtestado.bat` (script para facilitar a execução)
 
 ### 2. Preparação da planilha:
 Abra o arquivo `atestados.xlsx` e preencha os dados na planilha "Plan1":
@@ -16,8 +15,7 @@ Abra o arquivo `atestados.xlsx` e preencha os dados na planilha "Plan1":
 - **Coluna D**: Data de fim do atestado (formato: DD/MM/AAAA)
 
 ### 3. Execução:
-1. **Opção 1 (Recomendada)**: Clique duas vezes no arquivo `Executar_AutoAtestado.bat`
-2. **Opção 2**: Execute diretamente o `AutoAtestado.exe`
+2. **Opção 1**: Execute diretamente o `AutoAtestado.exe`
 
 ### 4. Durante a execução:
 - O programa solicitará seu usuário e senha do sistema SENAC
@@ -41,7 +39,6 @@ pasta_do_programa/
 ├── AutoAtestado.exe (ou pasta AutoAtestado/)
 ├── atestados.xlsx
 ├── chromedriver.exe
-├── Executar_AutoAtestado.bat
 ├── README.md
 └── log/ (criada automaticamente)
     └── log_DD_MM_AA__HH_MMh.txt
