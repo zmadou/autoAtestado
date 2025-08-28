@@ -1,3 +1,71 @@
-build
-dist
-log
+# Arquivos de build e distribuição
+build/
+dist/
+*.exe
+*.pkg
+*.zip
+*.spec
+
+# Logs
+log/
+*.log
+*.txt
+
+# Arquivos de dados sensíveis
+*.xlsx
+*.xls
+*.csv
+
+# Drivers externos
+chromedriver.exe
+geckodriver.exe
+*.driver
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+*.egg-info/
+.pytest_cache/
+
+# IDEs e editores
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Sistema operacional
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Arquivos temporários
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Certificados e chaves
+*.pem
+*.key
+*.crt
+*.p12
+
+# Configurações locais
+config.ini
+settings.json
+.env
+.env.local
