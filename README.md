@@ -19,7 +19,7 @@ Abra o arquivo `atestados.xlsx` e preencha os dados na planilha "Plan1":
 2. **Opção 1**: Execute diretamente o `AutoAtestado.exe`
 
 ### 4. Durante a execução:
-- O programa solicitará seu usuário e senha do sistema SENAC
+- O programa solicitará seu usuário e senha do sistema SS
 - Aguarde o processamento de cada aluno
 - Um arquivo de log será criado na pasta `log` com o registro de todas as operações
 
