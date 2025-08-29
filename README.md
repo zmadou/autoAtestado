@@ -1,4 +1,4 @@
-# AUTO ATESTADO - SENAC
+# AUTO ATESTADO
 Parceria com [Samuel Batista](https://github.com/Samuel-Batista)
 
 ## Como usar:
