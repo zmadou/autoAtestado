@@ -180,6 +180,11 @@ def processar_atestados(user, password, status_cb=None, resume_event=None, stop_
             current_inicio = row[2].value
             current_fim = row[3].value
 
+            # Se o ID for None ou vazio, significa que chegou ao fim das linhas preenchidas
+            if current_id is None or str(current_id).strip() == '':
+                notify("Fim das linhas preenchidas alcançado.")
+                break
+
             notify(f"Processando aluno {current_id}...")
             # Lista para armazenar as aulas processadas para este aluno
             aulas_processadas = []
@@ -243,9 +248,14 @@ def processar_atestados(user, password, status_cb=None, resume_event=None, stop_
                 for elemento in primeira_coluna_elementos:
                     texto = elemento.text.strip()
                     if re.fullmatch(r'\d+', texto):  # Só números
-                        elementos_aulas.append(elemento)
+                        if len(texto) > 4:
+                            # Pular aulas com mais de 4 dígitos (geralmente FIC)
+                            print(f"⚠️ Pulando aula {texto} - mais de 4 dígitos (provavelmente FIC)")
+                            aulas_processadas.append(f"Aula {texto} - Pulada (mais de 4 dígitos)")
+                        else:
+                            elementos_aulas.append(elemento)
 
-                notify(f"Encontradas {len(elementos_aulas)} aulas para o aluno {current_id}.")
+                notify(f"Encontradas {len(elementos_aulas)} aulas válidas para o aluno {current_id}.")
 
                 # Agora vamos clicar um a um nos elementos de aula
                 for i in range(len(elementos_aulas)):
@@ -268,11 +278,15 @@ def processar_atestados(user, password, status_cb=None, resume_event=None, stop_
                         if colunas:
                             primeira_coluna_elementos.append(colunas[0])
 
-                    # Filtra os elementos que você quer clicar (apenas números de aula)
-                    elementos_aulas = [elem for elem in primeira_coluna_elementos if len(elem.text.strip()) <= 4]
+                    # Filtra os elementos válidos (apenas números de até 4 dígitos)
+                    elementos_aulas_validos = []
+                    for elem in primeira_coluna_elementos:
+                        texto = elem.text.strip()
+                        if re.fullmatch(r'\d+', texto) and len(texto) <= 4:
+                            elementos_aulas_validos.append(elem)
 
                     # Agora pega o elemento atual baseado no índice do loop
-                    elemento = elementos_aulas[i]
+                    elemento = elementos_aulas_validos[i]
                     numero_aula = elemento.text.strip()
 
                     try:
@@ -286,6 +300,8 @@ def processar_atestados(user, password, status_cb=None, resume_event=None, stop_
                     except Exception as e:
                         print(f"❌ Erro ao clicar no link do elemento {i+1}: {e}")
                         continue
+                        print(f"❌ Erro ao clicar no link do elemento {i+1}: {e}")
+                        continue
 
                     # Aqui dentro da página aberta, verifica se o texto "Matric" está presente
                     try:
@@ -296,7 +312,16 @@ def processar_atestados(user, password, status_cb=None, resume_event=None, stop_
                         print(tabela_verificacao.text)
 
                         if "Matric" in tabela_verificacao.text:
-                            print("✅ O texto 'Matric' foi encontrado na tabela.")
+                            # Verificar se também contém "FIC" - se sim, pular
+                            if "FIC" in tabela_verificacao.text:
+                                print("⚠️ O texto 'Matric' foi encontrado, mas também contém 'FIC'. Pulando esta aula.")
+                                clicar_assim_aparecer(By.XPATH, '//*[@id="DERIVED_AA2_DERIVED_LINK10$0"]')
+                                # Adicionar aula que foi pulada à lista
+                                aulas_processadas.append(f"Aula {numero_aula} - Pulada (Matric + FIC)")
+                                sleep(2)
+                                continue
+
+                            print("✅ O texto 'Matric' foi encontrado na tabela (sem FIC).")
                             clicar_assim_aparecer(By.XPATH, '//*[@id="ICTAB_1"]')
 
                             # Inserir as datas e informações
@@ -393,6 +418,12 @@ class App(tk.Tk):
         self.geometry("460x300")
         self.resizable(False, False)
 
+        # Adicionar ícone se existir
+        try:
+            self.iconbitmap("icon.ico")
+        except Exception:
+            pass  # Se não encontrar o ícone, continua sem ele
+
         # Estado
         self.worker_thread = None
         self.resume_event = threading.Event(); self.resume_event.set()
@@ -401,6 +432,15 @@ class App(tk.Tk):
         self.is_paused = False
         self.pending_restart = False
         self.status_queue = Queue()
+
+        # Estado
+        self.worker_thread = None
+        self.resume_event = threading.Event(); self.resume_event.set()
+        self.stop_event = threading.Event()
+        self.is_running = False
+        self.is_paused = False
+        self.processo_concluido = False
+        self.processo_erro = None
 
         # UI
         padding = {"padx": 8, "pady": 6}
@@ -488,11 +528,12 @@ class App(tk.Tk):
                 processar_atestados(user, pwd, status_cb=self._enqueue_status, resume_event=self.resume_event, stop_event=self.stop_event)
                 # Notificar término (se não foi parado manualmente)
                 if not self.stop_event.is_set():
-                    self._enqueue_status("Concluído. Veja o log na pasta 'log'.")
-                    self.after(0, lambda: messagebox.showinfo("AutoAtestado", "Processamento concluído!"))
+                    self._enqueue_status("🎉 Processamento concluído! Verifique o arquivo de log na pasta 'log'.")
+                    # Marcar como concluído para mostrar o pop-up
+                    self.processo_concluido = True
             except Exception as e:
-                self._enqueue_status(f"Erro: {e}")
-                self.after(0, lambda: messagebox.showerror("Erro", f"Falha na execução: {e}"))
+                self._enqueue_status(f"❌ Erro: {e}")
+                self.processo_erro = str(e)
             finally:
                 # Restaurar UI
                 def restore():
@@ -503,6 +544,15 @@ class App(tk.Tk):
                     self.start_btn.configure(state=tk.NORMAL)
                     self.pause_btn.configure(state=tk.DISABLED, text="Pausar")
                     self.stop_btn.configure(state=tk.DISABLED)
+                    self.restart_btn.configure(state=tk.DISABLED)
+
+                    # Verificar se deve mostrar pop-up de conclusão
+                    if hasattr(self, 'processo_concluido') and self.processo_concluido:
+                        messagebox.showinfo("AutoAtestado - Concluído", "Processamento concluído com sucesso!\n\nVerifique o arquivo de log na pasta 'log' para detalhes.")
+                        self.processo_concluido = False
+                    elif hasattr(self, 'processo_erro') and self.processo_erro:
+                        messagebox.showerror("AutoAtestado - Erro", f"Falha na execução:\n\n{self.processo_erro}")
+                        self.processo_erro = None
                 self.after(0, restore)
 
         self.worker_thread = threading.Thread(target=target, daemon=True)
