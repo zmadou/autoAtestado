@@ -12,6 +12,112 @@ import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 from queue import Queue
+import json
+import base64
+import ctypes
+from ctypes import wintypes
+
+class _DATA_BLOB(ctypes.Structure):
+    _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
+
+def _protect_data(plain: bytes) -> bytes:
+    crypt32 = ctypes.WinDLL("crypt32")
+    kernel32 = ctypes.WinDLL("kernel32")
+
+    in_buffer = ctypes.create_string_buffer(plain)
+    in_blob = _DATA_BLOB(len(plain), ctypes.cast(in_buffer, ctypes.POINTER(ctypes.c_byte)))
+    out_blob = _DATA_BLOB()
+
+    if not crypt32.CryptProtectData(ctypes.byref(in_blob), None, None, None, None, 0, ctypes.byref(out_blob)):
+        raise RuntimeError("Falha ao proteger dados (DPAPI)")
+
+    try:
+        protected = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+        return protected
+    finally:
+        kernel32.LocalFree(out_blob.pbData)
+
+def _unprotect_data(protected: bytes) -> bytes:
+    crypt32 = ctypes.WinDLL("crypt32")
+    kernel32 = ctypes.WinDLL("kernel32")
+
+    in_buffer = ctypes.create_string_buffer(protected)
+    in_blob = _DATA_BLOB(len(protected), ctypes.cast(in_buffer, ctypes.POINTER(ctypes.c_byte)))
+    out_blob = _DATA_BLOB()
+
+    if not crypt32.CryptUnprotectData(ctypes.byref(in_blob), None, None, None, None, 0, ctypes.byref(out_blob)):
+        raise RuntimeError("Falha ao descriptografar dados (DPAPI)")
+
+    try:
+        plain = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+        return plain
+    finally:
+        kernel32.LocalFree(out_blob.pbData)
+
+def _cred_path() -> str:
+    appdata = os.getenv("APPDATA") or os.path.expanduser("~")
+    folder = os.path.join(appdata, "AutoAtestado")
+    if not os.path.exists(folder):
+        os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, "credentials.json")
+
+def load_saved_credentials():
+    try:
+        with open(_cred_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        user = data.get("username")
+        enc = data.get("password")
+        if user and enc:
+            decrypted = _unprotect_data(base64.b64decode(enc)).decode("utf-8")
+            return user, decrypted
+    except FileNotFoundError:
+        return None, None
+    except Exception:
+        return None, None
+    return None, None
+
+def save_credentials(username: str, password: str):
+    try:
+        protected = _protect_data(password.encode("utf-8"))
+        payload = {"username": username, "password": base64.b64encode(protected).decode("ascii")}
+        with open(_cred_path(), "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+    except Exception:
+        pass
+
+def clear_credentials():
+    try:
+        p = _cred_path()
+        if os.path.exists(p):
+            os.remove(p)
+    except Exception:
+        pass
+
+def _settings_path() -> str:
+    appdata = os.getenv("APPDATA") or os.path.expanduser("~")
+    folder = os.path.join(appdata, "AutoAtestado")
+    if not os.path.exists(folder):
+        os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, "settings.json")
+
+def load_settings():
+    try:
+        with open(_settings_path(), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"attend_reason": "Amparo Legal", "amparo_code": "0000000001", "search_year": "2025"}
+
+def save_settings(settings: dict):
+    try:
+        with open(_settings_path(), "w", encoding="utf-8") as f:
+            json.dump(settings, f)
+    except Exception:
+        pass
+def settings_exists() -> bool:
+    try:
+        return os.path.exists(_settings_path())
+    except Exception:
+        return False
 
 class LogManager:
     def __init__(self, log_dir: str = "log"):
@@ -86,7 +192,7 @@ class StopRequested(Exception):
     pass
 
 
-def processar_atestados(user, password, status_cb=None, resume_event=None, stop_event=None, excel_path='atestados.xlsx'):
+def processar_atestados(user, password, status_cb=None, resume_event=None, stop_event=None, excel_path='atestados.xlsx', config=None, process_fic=False):
     """
     Executa toda a automação. 
     - status_cb: função para receber mensagens de status (str)
@@ -120,6 +226,10 @@ def processar_atestados(user, password, status_cb=None, resume_event=None, stop_
             sleep(0.2)
 
     log_manager = LogManager()
+    year = (config.get("search_year") if config else "")
+    found_count = 0
+    processed_count = 0
+    not_found_count = 0
 
     # Carregar planilha (externa ao programa)
     try:
@@ -213,17 +323,20 @@ def processar_atestados(user, password, status_cb=None, resume_event=None, stop_
                 encontrou = False
                 for linha in linhas:
                     texto = linha.text.upper()
-                    if "2025" in texto and "EMÉDIO" in texto:
+                    if year and year in texto and "EMÉDIO" in texto:
                         link = linha.find_element(By.XPATH, ".//a")
                         link.click()
                         encontrou = True
+                        found_count += 1
                         break
 
                 if not encontrou:
                     status_processamento = "ERRO"
-                    observacoes = "Aluno não encontrado ou não possui curso EMÉDIO 2025"
+                    msg = f"Aluno não encontrado ou sem EMÉDIO {year}" if year else "Aluno não encontrado ou sem EMÉDIO"
+                    observacoes = msg
                     log_manager.registrar_lancamento(current_id, aulas_processadas, status_processamento, observacoes)
-                    notify(f"Aluno {current_id}: não encontrado/sem EMÉDIO 2025")
+                    notify(f"Aluno {current_id}: {msg}")
+                    not_found_count += 1
                     continue
 
                 driver.switch_to.default_content()
@@ -247,10 +360,9 @@ def processar_atestados(user, password, status_cb=None, resume_event=None, stop_
 
                 for elemento in primeira_coluna_elementos:
                     texto = elemento.text.strip()
-                    if re.fullmatch(r'\d+', texto):  # Só números
-                        if len(texto) > 4:
-                            # Pular aulas com mais de 4 dígitos (geralmente FIC)
-                            print(f"⚠️ Pulando aula {texto} - mais de 4 dígitos (provavelmente FIC)")
+                    if re.fullmatch(r'\d+', texto):
+                        if len(texto) > 4 and not process_fic:
+                            print(f"⚠️ Pulando aula {texto} - mais de 4 dígitos")
                             aulas_processadas.append(f"Aula {texto} - Pulada (mais de 4 dígitos)")
                         else:
                             elementos_aulas.append(elemento)
@@ -282,7 +394,7 @@ def processar_atestados(user, password, status_cb=None, resume_event=None, stop_
                     elementos_aulas_validos = []
                     for elem in primeira_coluna_elementos:
                         texto = elem.text.strip()
-                        if re.fullmatch(r'\d+', texto) and len(texto) <= 4:
+                        if re.fullmatch(r'\d+', texto) and (len(texto) <= 4 or process_fic):
                             elementos_aulas_validos.append(elem)
 
                     # Agora pega o elemento atual baseado no índice do loop
@@ -328,18 +440,18 @@ def processar_atestados(user, password, status_cb=None, resume_event=None, stop_
                             colocar_assim_aparecer(By.XPATH, '//*[@id="DIG_APR_EST_WRK_START_DT"]', current_inicio.strftime('%d/%m/%Y'))
                             colocar_assim_aparecer(By.XPATH, '//*[@id="DIG_APR_EST_WRK_END_DT"]', current_fim.strftime('%d/%m/%Y'))
 
-                            # Selecionar "Amparo Legal" no select
                             select_element = WebDriverWait(driver, 15).until(
                                 EC.presence_of_element_located((By.XPATH, '//*[@id="DIG_APR_EST_WRK_ATTEND_REASON"]'))
                             )
+                            selected_reason = (config.get("attend_reason") if config else "Amparo Legal")
                             for option in select_element.find_elements(By.TAG_NAME, 'option'):
-                                if option.text.strip() == "Amparo Legal":
+                                if option.text.strip() == selected_reason:
                                     option.click()
-                                    print("✅ Opção 'Amparo Legal' selecionada.")
+                                    print(f"✅ Opção '{selected_reason}' selecionada.")
                                     break
-
-                            # Inserir o motivo
-                            colocar_assim_aparecer(By.XPATH, '//*[@id="DIG_APR_EST_WRK_REASON_DESCR"]', "0000000001")
+                            if selected_reason == "Amparo Legal":
+                                selected_code = (config.get("amparo_code") if config else "0000000001")
+                                colocar_assim_aparecer(By.XPATH, '//*[@id="DIG_APR_EST_WRK_REASON_DESCR"]', selected_code)
 
                             print("✅ Dados inseridos com sucesso.")
 
@@ -352,6 +464,7 @@ def processar_atestados(user, password, status_cb=None, resume_event=None, stop_
 
                             # Adicionar aula processada com sucesso à lista
                             aulas_processadas.append(f"Aula {numero_aula} - Lançamento realizado")
+                            processed_count += 1
                             sleep(2)
                             
                         else:
@@ -400,7 +513,14 @@ def processar_atestados(user, password, status_cb=None, resume_event=None, stop_
 
             notify(f"Aluno {current_id} finalizado.")
 
-        notify("🎉 Processamento concluído! Verifique o arquivo de log na pasta 'log'.")
+        if found_count == 0:
+            if year:
+                notify(f"Nenhuma linha encontrada para EMÉDIO {year}.")
+            else:
+                notify("Nenhuma linha encontrada.")
+        else:
+            notify("🎉 Processamento concluído! Verifique o arquivo de log na pasta 'log'.")
+        return {"found_count": found_count, "processed_count": processed_count, "not_found_count": not_found_count, "year": year}
 
     except StopRequested:
         notify("Execução interrompida pelo usuário.")
@@ -415,7 +535,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("AutoAtestado - SENAC")
-        self.geometry("460x300")
+        self.geometry("720x580")
         self.resizable(False, False)
 
         # Adicionar ícone se existir
@@ -432,6 +552,13 @@ class App(tk.Tk):
         self.is_paused = False
         self.pending_restart = False
         self.status_queue = Queue()
+        self.settings_open = False
+        self.status_order = []
+        self.status_by_id = {}
+        self.planilha_preview = []
+        self.completed_order = []
+        self.active_order = []
+        self.error_order = []
 
         # Estado
         self.worker_thread = None
@@ -445,45 +572,131 @@ class App(tk.Tk):
         # UI
         padding = {"padx": 8, "pady": 6}
         frm = ttk.Frame(self)
-        frm.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        frm.pack(fill=tk.BOTH, expand=True, padx=10, pady=10) 
+        try:
+            for i in range(4):
+                frm.grid_columnconfigure(i, weight=1)
+            frm.grid_columnconfigure(0, weight=0)
+            frm.grid_columnconfigure(1, weight=1)
+            frm.grid_columnconfigure(2, weight=1)
+            frm.grid_columnconfigure(3, weight=1)
+        except Exception:
+            pass
 
-        ttk.Label(frm, text="Usuário:").grid(row=0, column=0, sticky="w", **padding)
+        hdr = ttk.Frame(frm)
+        hdr.grid(row=0, column=0, columnspan=4, sticky="ew")
+        try:
+            hdr.grid_columnconfigure(0, weight=1)
+            hdr.grid_columnconfigure(1, weight=0)
+        except Exception:
+            pass
+        self.settings_btn = ttk.Button(hdr, text="Config", width=8, command=self.open_settings)
+        self.settings_btn.grid(row=0, column=1, sticky="e", padx=4, pady=2)
+
+        ttk.Label(frm, text="Usuário:").grid(row=1, column=0, sticky="w", **padding)
         self.user_var = tk.StringVar()
-        self.user_entry = ttk.Entry(frm, textvariable=self.user_var, width=32)
-        self.user_entry.grid(row=0, column=1, columnspan=3, sticky="w", **padding)
+        self.user_entry = ttk.Entry(frm, textvariable=self.user_var, width=28)
+        self.user_entry.grid(row=1, column=1, columnspan=2, sticky="w", **padding)
 
-        ttk.Label(frm, text="Senha:").grid(row=1, column=0, sticky="w", **padding)
+        ttk.Label(frm, text="Senha:").grid(row=2, column=0, sticky="w", **padding)
         self.pass_var = tk.StringVar()
-        self.pass_entry = ttk.Entry(frm, textvariable=self.pass_var, width=32, show="*")
-        self.pass_entry.grid(row=1, column=1, columnspan=3, sticky="w", **padding)
+        self.pass_entry = ttk.Entry(frm, textvariable=self.pass_var, width=28, show="*")
+        self.pass_entry.grid(row=2, column=1, columnspan=2, sticky="w", **padding)
 
-        self.start_btn = ttk.Button(frm, text="Iniciar", command=self.on_start)
-        self.start_btn.grid(row=2, column=0, **padding)
+        self.remember_var = tk.BooleanVar(value=False)
+        self.remember_cb = ttk.Checkbutton(frm, text="Lembrar credenciais", variable=self.remember_var)
+        self.remember_cb.grid(row=3, column=0, columnspan=4, sticky="w", **padding)
+        self.process_fic_var = tk.BooleanVar(value=False)
+        self.process_fic_cb = ttk.Checkbutton(frm, text="Lançar amparo em aulas FIC", variable=self.process_fic_var)
+        self.process_fic_cb.grid(row=4, column=0, columnspan=4, sticky="w", **padding)
 
-        self.pause_btn = ttk.Button(frm, text="Pausar", command=self.on_pause_resume, state=tk.DISABLED)
-        self.pause_btn.grid(row=2, column=1, **padding)
+        btns = ttk.Frame(frm)
+        btns.grid(row=5, column=0, columnspan=4, sticky="ew")
+        try:
+            btns.grid_columnconfigure(0, weight=1)
+            btns.grid_columnconfigure(1, weight=1)
+        except Exception:
+            pass
+        self.start_btn = ttk.Button(btns, text="Iniciar", command=self.on_start)
+        self.start_btn.grid(row=0, column=0, sticky="ew", **padding)
+        self.pause_btn = ttk.Button(btns, text="Pausar", command=self.on_pause_resume, state=tk.DISABLED)
+        self.pause_btn.grid(row=0, column=1, sticky="ew", **padding)
+        self.stop_btn = ttk.Button(btns, text="Parar", command=self.on_stop, state=tk.DISABLED)
+        self.stop_btn.grid(row=1, column=0, sticky="ew", **padding)
+        self.restart_btn = ttk.Button(btns, text="Reiniciar", command=self.on_restart)
+        self.restart_btn.grid(row=1, column=1, sticky="ew", **padding)
 
-        self.stop_btn = ttk.Button(frm, text="Parar", command=self.on_stop, state=tk.DISABLED)
-        self.stop_btn.grid(row=2, column=2, **padding)
+        ttk.Separator(frm).grid(row=6, column=0, columnspan=4, sticky="ew", pady=(10, 0))
 
-        self.restart_btn = ttk.Button(frm, text="Reiniciar", command=self.on_restart)
-        self.restart_btn.grid(row=2, column=3, **padding)
-
-        ttk.Separator(frm).grid(row=3, column=0, columnspan=4, sticky="ew", pady=(10, 0))
-
-        ttk.Label(frm, text="Status:").grid(row=4, column=0, sticky="w", **padding)
+        ttk.Label(frm, text="Status:").grid(row=7, column=0, columnspan=4, sticky="w", **padding)
         self.status_var = tk.StringVar(value="Pronto.")
         self.status_lbl = ttk.Label(frm, textvariable=self.status_var, wraplength=400, anchor="w", justify="left")
-        self.status_lbl.grid(row=4, column=1, columnspan=3, sticky="w", **padding)
+        self.status_lbl.grid(row=7, column=0, columnspan=4, sticky="w", **padding)
+        self.progress_text = tk.StringVar(value="Progresso: 0/0")
+        ttk.Label(frm, textvariable=self.progress_text).grid(row=8, column=0, columnspan=4, sticky="w", padx=10)
+        self.progress = ttk.Progressbar(frm, mode="determinate")
+        self.progress.grid(row=9, column=0, columnspan=4, sticky="ew", padx=10)
+        self.status_tree = ttk.Treeview(frm, columns=("id", "periodo", "status"), show="headings", height=10)
+        self.status_tree.heading("id", text="ID")
+        self.status_tree.heading("periodo", text="Período")
+        self.status_tree.heading("status", text="Status")
+        self.status_tree.column("id", width=140, anchor="w")
+        self.status_tree.column("periodo", width=200, anchor="w")
+        self.status_tree.column("status", width=100, anchor="w")
+        self.status_tree.grid(row=10, column=0, columnspan=3, sticky="nsew", padx=10)
+        self.status_scroll = ttk.Scrollbar(frm, orient="vertical", command=self.status_tree.yview)
+        self.status_scroll.grid(row=10, column=3, sticky="ns")
+        self.status_tree.configure(yscrollcommand=self.status_scroll.set)
+        try:
+            self.status_tree.tag_configure("concluído", foreground="#2e7d32")
+            self.status_tree.tag_configure("carregando", foreground="#f9a825")
+            self.status_tree.tag_configure("erro", foreground="#c62828")
+            self.status_tree.tag_configure("aguardando", foreground="#616161")
+            frm.grid_rowconfigure(10, weight=1)
+        except Exception:
+            pass
 
         # Info da planilha (externa)
-        ttk.Label(frm, text="Planilha: 'atestados.xlsx' (mesma pasta do programa)").grid(row=5, column=0, columnspan=4, sticky="w", padx=8)
+        ttk.Label(frm, text="Planilha: 'atestados.xlsx' (mesma pasta do programa)").grid(row=11, column=0, columnspan=4, sticky="w", padx=8)
 
-        self.bind('<Return>', lambda e: self.on_start() if not self.is_running else None)
+        self.bind('<Return>', lambda e: self.on_start() if (not self.is_running and not self.settings_open) else None)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
         # Poll da fila de status
         self.after(200, self._poll_status)
+
+        # Carregar credenciais salvas, se existirem
+        try:
+            u, p = load_saved_credentials()
+            if u and p:
+                self.user_var.set(u)
+                self.pass_var.set(p)
+                self.remember_var.set(True)
+        except Exception:
+            pass
+        s = load_settings()
+        self.attend_reason = s.get("attend_reason", "Amparo Legal")
+        self.amparo_code = s.get("amparo_code", "0000000001")
+        self.search_year = s.get("search_year", "2025")
+        try:
+            wb = load_workbook('atestados.xlsx')
+            ws = wb['Plan1']
+            for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+                idv = row[1].value
+                ini = row[2].value
+                fim = row[3].value
+                if idv and str(idv).strip() != '':
+                    id_s = str(idv)
+                    self.planilha_preview.append((id_s, ini, fim))
+                    self.status_by_id[id_s] = "aguardando"
+                    self.status_order.append(id_s)
+            total = len(self.planilha_preview)
+            self.progress.configure(mode="determinate", maximum=max(1, total))
+            self.progress['value'] = 0
+            self.progress_text.set(f"Progresso: 0/{total}")
+            self._render_status()
+        except Exception:
+            pass
 
     def _enqueue_status(self, msg: str):
         self.status_queue.put(msg)
@@ -492,6 +705,35 @@ class App(tk.Tk):
         try:
             while True:
                 msg = self.status_queue.get_nowait()
+                m = re.search(r'Processando aluno\s+(\d+)', msg)
+                if m:
+                    self.status_by_id[m.group(1)] = "carregando"
+                    if m.group(1) not in self.active_order:
+                        self.active_order.append(m.group(1))
+                    if m.group(1) in self.completed_order:
+                        self.completed_order.remove(m.group(1))
+                    if m.group(1) in self.error_order:
+                        self.error_order.remove(m.group(1))
+                    self._render_status()
+                    continue
+                m = re.search(r'Aluno\s+(\d+)\s+finalizado\.', msg)
+                if m:
+                    self.status_by_id[m.group(1)] = "concluído"
+                    if m.group(1) in self.active_order:
+                        self.active_order.remove(m.group(1))
+                    if m.group(1) not in self.completed_order:
+                        self.completed_order.append(m.group(1))
+                    self._render_status()
+                    continue
+                m = re.search(r'Aluno\s+(\d+):', msg)
+                if m:
+                    self.status_by_id[m.group(1)] = "erro"
+                    if m.group(1) in self.active_order:
+                        self.active_order.remove(m.group(1))
+                    if m.group(1) not in self.error_order:
+                        self.error_order.append(m.group(1))
+                    self._render_status()
+                    continue
                 self.status_var.set(msg)
         except Exception:
             pass
@@ -501,6 +743,81 @@ class App(tk.Tk):
             self.on_start()
         self.after(200, self._poll_status)
 
+    def _render_status(self):
+        lines = []
+        def fmt(idv, ini, fim):
+            st = self.status_by_id.get(idv, "aguardando")
+            d1 = ini.strftime('%d/%m/%Y') if hasattr(ini, 'strftime') else (ini if ini else '')
+            d2 = fim.strftime('%d/%m/%Y') if hasattr(fim, 'strftime') else (fim if fim else '')
+            return f"{idv} - {d1} a {d2} [{st}]"
+
+        preview_map = {idv: (ini, fim) for idv, ini, fim in self.planilha_preview}
+
+        for idv in self.completed_order:
+            if idv in preview_map:
+                ini, fim = preview_map[idv]
+                lines.append(fmt(idv, ini, fim))
+        for idv in self.error_order:
+            if idv in preview_map and idv not in self.completed_order:
+                ini, fim = preview_map[idv]
+                lines.append(fmt(idv, ini, fim))
+        for idv, ini, fim in self.planilha_preview:
+            if idv not in self.completed_order and idv not in self.error_order and idv not in self.active_order:
+                lines.append(fmt(idv, ini, fim))
+        for idv in self.active_order:
+            if idv in preview_map:
+                ini, fim = preview_map[idv]
+                lines.append(fmt(idv, ini, fim))
+        try:
+            for item in self.status_tree.get_children():
+                self.status_tree.delete(item)
+            def insert_line(idv, ini, fim):
+                st = self.status_by_id.get(idv, "aguardando")
+                d1 = ini.strftime('%d/%m/%Y') if hasattr(ini, 'strftime') else (ini if ini else '')
+                d2 = fim.strftime('%d/%m/%Y') if hasattr(fim, 'strftime') else (fim if fim else '')
+                self.status_tree.insert('', 'end', values=(idv, f"{d1} a {d2}", st), tags=(st,))
+            for idv in self.completed_order:
+                if idv in preview_map:
+                    ini, fim = preview_map[idv]
+                    insert_line(idv, ini, fim)
+            for idv in self.error_order:
+                if idv in preview_map and idv not in self.completed_order:
+                    ini, fim = preview_map[idv]
+                    insert_line(idv, ini, fim)
+            for idv, ini, fim in self.planilha_preview:
+                if idv not in self.completed_order and idv not in self.error_order and idv not in self.active_order:
+                    insert_line(idv, ini, fim)
+            for idv in self.active_order:
+                if idv in preview_map:
+                    ini, fim = preview_map[idv]
+                    insert_line(idv, ini, fim)
+            total = len(self.planilha_preview)
+            done = len(self.completed_order)
+            try:
+                self.progress.configure(mode="determinate", maximum=max(1, total))
+                self.progress['value'] = done
+            except Exception:
+                pass
+            try:
+                self.progress_text.set(f"Progresso: {done}/{total}")
+            except Exception:
+                pass
+        except Exception:
+            self.status_var.set("\n".join(lines) if lines else "Pronto.")
+
+    def _position_right(self):
+        try:
+            self.update_idletasks()
+            w = self.winfo_width() or 460
+            h = self.winfo_height() or 300
+            sw = self.winfo_screenwidth()
+            x = max(0, sw - w - 20)
+            y = 20
+            self.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
+
+
     def on_start(self):
         if self.is_running:
             return
@@ -509,6 +826,14 @@ class App(tk.Tk):
         if not user or not pwd:
             messagebox.showwarning("Dados obrigatórios", "Informe usuário e senha.")
             return
+        allowed_reasons = ["Amparo Legal", "Aproveitamento de Estudos", "Matrícula Fora do Prazo"]
+        if not settings_exists() or not self.search_year or not self.attend_reason or self.attend_reason not in allowed_reasons or (self.attend_reason == "Amparo Legal" and not self.amparo_code):
+            messagebox.showwarning("Configurações necessárias", "Antes de iniciar, abra Config, escolha Ano e Razão e clique em Salvar.")
+            return
+        if self.remember_var.get():
+            save_credentials(user, pwd)
+        else:
+            clear_credentials()
         self.is_running = True
         self.is_paused = False
         self.resume_event.set()
@@ -522,20 +847,35 @@ class App(tk.Tk):
         self.stop_btn.configure(state=tk.NORMAL)
 
         self.status_var.set("Iniciando automação...")
+        try:
+            self._position_right()
+        except Exception:
+            pass
+        try:
+            total = len(self.planilha_preview)
+            self.progress.configure(mode="determinate", maximum=max(1, total))
+            self.progress['value'] = len(self.completed_order)
+            self.progress_text.set(f"Progresso: {len(self.completed_order)}/{total}")
+        except Exception:
+            pass
 
         def target():
             try:
-                processar_atestados(user, pwd, status_cb=self._enqueue_status, resume_event=self.resume_event, stop_event=self.stop_event)
-                # Notificar término (se não foi parado manualmente)
+                cfg = {"attend_reason": self.attend_reason, "amparo_code": self.amparo_code, "search_year": self.search_year}
+                result = processar_atestados(user, pwd, status_cb=self._enqueue_status, resume_event=self.resume_event, stop_event=self.stop_event, config=cfg, process_fic=self.process_fic_var.get())
                 if not self.stop_event.is_set():
-                    self._enqueue_status("🎉 Processamento concluído! Verifique o arquivo de log na pasta 'log'.")
-                    # Marcar como concluído para mostrar o pop-up
-                    self.processo_concluido = True
+                    if result and result.get("found_count", 0) == 0:
+                        yr = result.get("year") or ""
+                        msg = f"Nenhuma linha encontrada para EMÉDIO {yr}." if yr else "Nenhuma linha encontrada."
+                        self._enqueue_status(msg)
+                        self.processo_erro = msg
+                    else:
+                        self._enqueue_status("🎉 Processamento concluído! Verifique o arquivo de log na pasta 'log'.")
+                        self.processo_concluido = True
             except Exception as e:
                 self._enqueue_status(f"❌ Erro: {e}")
                 self.processo_erro = str(e)
             finally:
-                # Restaurar UI
                 def restore():
                     self.is_running = False
                     self.is_paused = False
@@ -545,6 +885,11 @@ class App(tk.Tk):
                     self.pause_btn.configure(state=tk.DISABLED, text="Pausar")
                     self.stop_btn.configure(state=tk.DISABLED)
                     self.restart_btn.configure(state=tk.DISABLED)
+                    try:
+                        self.progress.stop()
+                        self.progress.configure(mode="determinate")
+                    except Exception:
+                        pass
 
                     # Verificar se deve mostrar pop-up de conclusão
                     if hasattr(self, 'processo_concluido') and self.processo_concluido:
@@ -557,6 +902,91 @@ class App(tk.Tk):
 
         self.worker_thread = threading.Thread(target=target, daemon=True)
         self.worker_thread.start()
+
+    def open_settings(self):
+        dialog = tk.Toplevel(self)
+        dialog.title("Configurações")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+        self.settings_open = True
+        try:
+            self.start_btn.configure(state=tk.DISABLED)
+        except Exception:
+            pass
+        pad = {"padx": 10, "pady": 8}
+        frm = ttk.Frame(dialog)
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frm, text="Ano (4 dígitos):").grid(row=0, column=0, sticky="w", **pad)
+        year_var = tk.StringVar(value=str(self.search_year))
+        year_entry = ttk.Entry(frm, textvariable=year_var, width=10)
+        def validate_year(P):
+            return P.isdigit() and len(P) <= 4
+        vcmd = (self.register(validate_year), '%P')
+        year_entry.configure(validate='key', validatecommand=vcmd)
+        year_entry.grid(row=0, column=1, sticky="w", **pad)
+        ttk.Label(frm, text="Razão de ausência:").grid(row=1, column=0, sticky="w", **pad)
+        reasons = ["Amparo Legal", "Aproveitamento de Estudos", "Matrícula Fora do Prazo"]
+        reason_var = tk.StringVar(value=self.attend_reason)
+        reason_cb = ttk.Combobox(frm, textvariable=reason_var, values=reasons, state="readonly", width=28)
+        reason_cb.grid(row=1, column=1, sticky="w", **pad)
+        ttk.Label(frm, text="Motivo (Amparo Legal):").grid(row=2, column=0, sticky="w", **pad)
+        amparo_options = [
+            ("0000000001", "Problemas de saúde"),
+            ("0000000002", "Licença Maternidade"),
+            ("0000000003", "Adoção"),
+            ("0000000004", "Licença paternidade"),
+            ("0000000005", "Serviço militar"),
+            ("0000000006", "Representação desportiva"),
+            ("0000000008", "Educação Física"),
+            ("0000000009", "Crença religiosa"),
+        ]
+        amparo_display = [f"{code} - {desc}" for code, desc in amparo_options]
+        amparo_var = tk.StringVar()
+        try:
+            current_display = next(f"{c} - {d}" for c, d in amparo_options if c == self.amparo_code)
+            amparo_var.set(current_display)
+        except Exception:
+            amparo_var.set(amparo_display[0])
+        amparo_cb = ttk.Combobox(frm, textvariable=amparo_var, values=amparo_display, state="readonly", width=28)
+        amparo_cb.grid(row=2, column=1, sticky="w", **pad)
+        def on_reason_change(*_):
+            if reason_var.get() == "Amparo Legal":
+                amparo_cb.configure(state="readonly")
+            else:
+                amparo_cb.configure(state="disabled")
+        reason_var.trace_add("write", on_reason_change)
+        on_reason_change()
+        btns = ttk.Frame(frm)
+        btns.grid(row=3, column=0, columnspan=2, sticky="e", **pad)
+        def on_save():
+            self.attend_reason = reason_var.get()
+            if self.attend_reason == "Amparo Legal":
+                sel = amparo_var.get()
+                code = sel.split(" - ")[0]
+                self.amparo_code = code
+            yr = year_var.get()
+            yr_digits = "".join(ch for ch in yr if ch.isdigit())[:4]
+            if yr_digits:
+                self.search_year = yr_digits
+            s = {"attend_reason": self.attend_reason, "amparo_code": self.amparo_code}
+            s["search_year"] = self.search_year
+            save_settings(s)
+            dialog.destroy()
+            self.settings_open = False
+            try:
+                self.start_btn.configure(state=tk.NORMAL)
+            except Exception:
+                pass
+        ttk.Button(btns, text="Salvar", command=on_save).pack(side=tk.RIGHT, padx=4)
+        def on_cancel():
+            dialog.destroy()
+            self.settings_open = False
+            try:
+                self.start_btn.configure(state=tk.NORMAL)
+            except Exception:
+                pass
+        ttk.Button(btns, text="Cancelar", command=on_cancel).pack(side=tk.RIGHT)
 
     def on_pause_resume(self):
         if not self.is_running:
