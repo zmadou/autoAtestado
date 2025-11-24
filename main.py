@@ -15,6 +15,7 @@ from queue import Queue
 import json
 import base64
 import ctypes
+import sys
 from ctypes import wintypes
 
 class _DATA_BLOB(ctypes.Structure):
@@ -54,58 +55,156 @@ def _unprotect_data(protected: bytes) -> bytes:
     finally:
         kernel32.LocalFree(out_blob.pbData)
 
+class FILETIME(ctypes.Structure):
+    _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+
+class CREDENTIALW(ctypes.Structure):
+    _fields_ = [
+        ("Flags", wintypes.DWORD),
+        ("Type", wintypes.DWORD),
+        ("TargetName", wintypes.LPWSTR),
+        ("Comment", wintypes.LPWSTR),
+        ("LastWritten", FILETIME),
+        ("CredentialBlobSize", wintypes.DWORD),
+        ("CredentialBlob", ctypes.POINTER(ctypes.c_byte)),
+        ("Persist", wintypes.DWORD),
+        ("AttributeCount", wintypes.DWORD),
+        ("Attributes", ctypes.c_void_p),
+        ("TargetAlias", wintypes.LPWSTR),
+        ("UserName", wintypes.LPWSTR),
+    ]
+
+_advapi32 = ctypes.WinDLL("advapi32")
+_CredWriteW = _advapi32.CredWriteW
+_CredWriteW.argtypes = [ctypes.POINTER(CREDENTIALW), wintypes.DWORD]
+_CredWriteW.restype = wintypes.BOOL
+_CredReadW = _advapi32.CredReadW
+_CredReadW.argtypes = [wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(ctypes.POINTER(CREDENTIALW))]
+_CredReadW.restype = wintypes.BOOL
+_CredDeleteW = _advapi32.CredDeleteW
+_CredDeleteW.argtypes = [wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+_CredDeleteW.restype = wintypes.BOOL
+_CredFree = _advapi32.CredFree
+_CredFree.argtypes = [ctypes.c_void_p]
+_CredFree.restype = None
+
+def _cm_target() -> str:
+    return "AutoAtestado:login"
+
+def _app_dir() -> str:
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
 def _cred_path() -> str:
+    base = os.path.join(_app_dir(), "log", "config")
+    if not os.path.exists(base):
+        os.makedirs(base, exist_ok=True)
+    return os.path.join(base, "credentials.json")
+
+def _legacy_cred_path() -> str:
     appdata = os.getenv("APPDATA") or os.path.expanduser("~")
     folder = os.path.join(appdata, "AutoAtestado")
-    if not os.path.exists(folder):
-        os.makedirs(folder, exist_ok=True)
     return os.path.join(folder, "credentials.json")
 
 def load_saved_credentials():
     try:
-        with open(_cred_path(), "r", encoding="utf-8") as f:
-            data = json.load(f)
-        user = data.get("username")
-        enc = data.get("password")
-        if user and enc:
-            decrypted = _unprotect_data(base64.b64decode(enc)).decode("utf-8")
-            return user, decrypted
-    except FileNotFoundError:
-        return None, None
+        cred_ptr = ctypes.POINTER(CREDENTIALW)()
+        if _CredReadW(_cm_target(), 1, 0, ctypes.byref(cred_ptr)):
+            try:
+                cred = cred_ptr.contents
+                size = int(cred.CredentialBlobSize)
+                data = ctypes.string_at(cred.CredentialBlob, size)
+                try:
+                    s = data.decode("utf-8", errors="ignore")
+                except Exception:
+                    s = ""
+                if "\n" in s:
+                    u, p = s.split("\n", 1)
+                    return u, p
+                if cred.UserName:
+                    return cred.UserName, s
+            finally:
+                _CredFree(cred_ptr)
+        path = _cred_path()
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            user = data.get("username")
+            enc = data.get("password")
+            if user and enc:
+                decrypted = _unprotect_data(base64.b64decode(enc)).decode("utf-8")
+                return user, decrypted
+        leg = _legacy_cred_path()
+        if os.path.exists(leg):
+            with open(leg, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            user = data.get("username")
+            enc = data.get("password")
+            if user and enc:
+                decrypted = _unprotect_data(base64.b64decode(enc)).decode("utf-8")
+                return user, decrypted
     except Exception:
         return None, None
     return None, None
 
 def save_credentials(username: str, password: str):
     try:
-        protected = _protect_data(password.encode("utf-8"))
-        payload = {"username": username, "password": base64.b64encode(protected).decode("ascii")}
-        with open(_cred_path(), "w", encoding="utf-8") as f:
-            json.dump(payload, f)
+        blob = f"{username}\n{password}".encode("utf-8")
+        buf = ctypes.create_string_buffer(blob)
+        cred = CREDENTIALW()
+        cred.Flags = 0
+        cred.Type = 1
+        cred.TargetName = _cm_target()
+        cred.Comment = None
+        cred.LastWritten = FILETIME(0, 0)
+        cred.CredentialBlobSize = len(blob)
+        cred.CredentialBlob = ctypes.cast(buf, ctypes.POINTER(ctypes.c_byte))
+        cred.Persist = 2
+        cred.AttributeCount = 0
+        cred.Attributes = None
+        cred.TargetAlias = None
+        cred.UserName = username
+        _CredWriteW(ctypes.byref(cred), 0)
+        try:
+            p = _cred_path()
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
     except Exception:
         pass
 
 def clear_credentials():
     try:
-        p = _cred_path()
-        if os.path.exists(p):
-            os.remove(p)
+        _CredDeleteW(_cm_target(), 1, 0)
     except Exception:
         pass
 
 def _settings_path() -> str:
+    base = os.path.join(_app_dir(), "log", "config")
+    if not os.path.exists(base):
+        os.makedirs(base, exist_ok=True)
+    return os.path.join(base, "settings.json")
+
+def _legacy_settings_path() -> str:
     appdata = os.getenv("APPDATA") or os.path.expanduser("~")
     folder = os.path.join(appdata, "AutoAtestado")
-    if not os.path.exists(folder):
-        os.makedirs(folder, exist_ok=True)
     return os.path.join(folder, "settings.json")
 
 def load_settings():
     try:
-        with open(_settings_path(), "r", encoding="utf-8") as f:
-            return json.load(f)
+        p = _settings_path()
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f)
+        lp = _legacy_settings_path()
+        if os.path.exists(lp):
+            with open(lp, "r", encoding="utf-8") as f:
+                return json.load(f)
     except Exception:
-        return {"attend_reason": "Amparo Legal", "amparo_code": "0000000001", "search_year": "2025"}
+        pass
+    return {"attend_reason": "Amparo Legal", "amparo_code": "0000000001", "search_year": "2025"}
 
 def save_settings(settings: dict):
     try:
